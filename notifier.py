@@ -149,8 +149,21 @@ class NotifierService:
         today_hash = hashlib.md5(json.dumps(times, sort_keys=True).encode("utf-8")).hexdigest()
         saved_today_hash = await db.get_state(f"today_times_hash_{today_str}")
 
+        has_outages = any(v in (STATUS_OFF, STATUS_MAYBE) for v in times.values())
+
         if saved_today_hash is None:
             await db.set_state(f"today_times_hash_{today_str}", today_hash)
+            # If the schedule was published today with outages and hasn't been announced yet:
+            announced_key = f"today_announced_{today_str}"
+            if not await db.get_state(announced_key) and has_outages:
+                await db.set_state(announced_key, "1")
+                schedule_text = ScheduleParser.format_schedule_text(today_sched, "сьогодні")
+                msg = (
+                    "📆 <b>Оприлюднено графік відключень на сьогодні!</b>\n"
+                    f"📍 {config.short_address} (Черга {config.CHER_GPV})\n\n"
+                    f"{schedule_text}"
+                )
+                await self.broadcast(msg, filter_key="notify_schedule_change")
         elif saved_today_hash != today_hash:
             logger.info("Today's timeslots actually changed! Broadcasting notification...")
             await db.set_state(f"today_times_hash_{today_str}", today_hash)
@@ -204,13 +217,13 @@ class NotifierService:
         last_status_key = f"last_status_{today_str}"
         last_status = await db.get_state(last_status_key)
 
-        if last_status is None:
-            await db.set_state(last_status_key, current_status)
-        elif last_status != current_status:
-            await db.set_state(last_status_key, current_status)
+        interval_start = curr_interval["start"] if curr_interval else "unknown"
+        alert_sent_key = f"alert_sent_{today_str}_{interval_start}_{current_status}"
 
-            # A) Transition to OUTAGE (🔴 1)
-            if current_status == STATUS_OFF:
+        # A) Active OUTAGE (🔴 1)
+        if current_status == STATUS_OFF:
+            if not await db.get_state(alert_sent_key):
+                await db.set_state(alert_sent_key, "1")
                 end_time = curr_interval["end"] if curr_interval else "кінця інтервалу"
                 dur_str = format_duration(curr_interval["end_minutes"] - curr_interval["start_minutes"]) if curr_interval else ""
                 dur_suffix = f" (на {dur_str})" if dur_str else ""
@@ -222,8 +235,9 @@ class NotifierService:
                 )
                 await self.broadcast(msg, filter_key="notify_outage")
 
-            # B) Transition to RESTORATION (🟢 0)
-            elif current_status == STATUS_ON and last_status in (STATUS_OFF, STATUS_MAYBE):
+        # B) Transition to RESTORATION (🟢 0)
+        elif current_status == STATUS_ON:
+            if last_status in (STATUS_OFF, STATUS_MAYBE):
                 next_outage_msg = ""
                 if next_interval and next_interval["status"] == STATUS_OFF:
                     next_outage_msg = f" (наступне вимкнення о {next_interval['start']})"
@@ -237,8 +251,10 @@ class NotifierService:
                 )
                 await self.broadcast(msg, filter_key="notify_restore")
 
-            # C) Transition to MAYBE OUTAGE (🟡 10)
-            elif current_status == STATUS_MAYBE and last_status == STATUS_ON:
+        # C) Transition to MAYBE OUTAGE (🟡 10)
+        elif current_status == STATUS_MAYBE:
+            if not await db.get_state(alert_sent_key):
+                await db.set_state(alert_sent_key, "1")
                 end_time = curr_interval["end"] if curr_interval else "кінця інтервалу"
                 msg = (
                     f"🟡 <b>Період можливого відключення (до {end_time})</b>\n"
@@ -246,6 +262,8 @@ class NotifierService:
                     f"⚠️ До <b>{end_time}</b> можливе відключення у разі перевищення лімітів."
                 )
                 await self.broadcast(msg, filter_key="notify_outage")
+
+        await db.set_state(last_status_key, current_status)
 
         # --- 3. Check Advance Warning (e.g. 15-30 mins before) ---
         intervals = ScheduleParser.get_intervals(times)

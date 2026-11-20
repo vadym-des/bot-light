@@ -63,6 +63,16 @@ async def main():
     health_app = web.Application()
     health_app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
     health_app.router.add_get("/health", lambda r: web.Response(text="OK"))
+
+    async def handle_info(request):
+        subs = await db.get_active_subscribers()
+        return web.json_response({
+            "status": "ok",
+            "active_subscribers_count": len(subs),
+            "subscribers": [{"chat_id": s["chat_id"], "first_name": s.get("first_name")} for s in subs]
+        })
+    health_app.router.add_get("/api/info", handle_info)
+
     runner = web.AppRunner(health_app)
     await runner.setup()
     port = int(os.getenv("PORT", "10000"))
@@ -73,12 +83,12 @@ async def main():
     # Start notifier background task
     notifier_task = asyncio.create_task(notifier_service.start())
 
-    # Keep-alive background task: pings itself every 3 min to prevent Render Free Tier from sleeping
+    # Keep-alive background task: pings itself every 2 min to prevent Render Free Tier from sleeping
     async def keep_alive():
         service_url = os.getenv("RENDER_EXTERNAL_URL", "https://bot-light-44ib.onrender.com").rstrip("/")
         health_url = f"{service_url}/health"
         logger.info(f"Keep-alive self-ping configured for: {health_url}")
-        await asyncio.sleep(30)  # Wait 30s after initial boot
+        await asyncio.sleep(20)  # Wait 20s after initial boot
         import aiohttp
         while True:
             try:
@@ -88,7 +98,7 @@ async def main():
                         logger.info(f"Keep-alive ping to {health_url}: status {resp.status}")
             except Exception as e:
                 logger.warning(f"Keep-alive ping error: {e}")
-            await asyncio.sleep(180)  # 3 minutes (Render sleeps after 15 min of inactivity)
+            await asyncio.sleep(120)  # 2 minutes
 
     keep_alive_task = asyncio.create_task(keep_alive())
 
