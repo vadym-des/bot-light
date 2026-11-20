@@ -42,5 +42,6 @@ class Config:
     
     DB_PATH: str = os.getenv("DB_PATH", "bot_data.db")
     TIMEZONE: str = os.getenv("TIMEZONE", "Europe/Kyiv")
+    DEFAULT_CHAT_ID: int = int(os.getenv("DEFAULT_CHAT_ID", "0"))
 
 config = Config()

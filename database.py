@@ -64,6 +64,10 @@ class Database:
             await db.commit()
         logger.info("Database initialized successfully with migrations.")
 
+        if config.DEFAULT_CHAT_ID:
+            await self.add_subscriber(config.DEFAULT_CHAT_ID, first_name="Owner")
+            logger.info(f"Default subscriber {config.DEFAULT_CHAT_ID} registered.")
+
     async def add_subscriber(self, chat_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""

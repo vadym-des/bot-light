@@ -1,8 +1,8 @@
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram import Router, F, BaseMiddleware
+from aiogram.types import Message, CallbackQuery, TelegramObject
 from aiogram.filters import CommandStart, Command
 
 from config import config
@@ -17,6 +17,24 @@ from keyboards import (
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+class AutoSubscribeMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        user = data.get("event_from_user")
+        if user and not user.is_bot:
+            try:
+                await db.add_subscriber(
+                    chat_id=user.id,
+                    username=user.username,
+                    first_name=user.first_name
+                )
+            except Exception as e:
+                logger.error(f"Error in AutoSubscribeMiddleware: {e}")
+        return await handler(event, data)
+
+router.message.middleware(AutoSubscribeMiddleware())
+router.callback_query.middleware(AutoSubscribeMiddleware())
+
 api_client = ToeApiClient()
 
 def get_current_time_str() -> str:
