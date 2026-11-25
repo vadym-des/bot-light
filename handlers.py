@@ -1,6 +1,8 @@
 import asyncio
 import html
 import logging
+import os
+import signal
 from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -183,6 +185,40 @@ async def _safe_edit_message(
     except Exception as e:
         logger.error(f"Unexpected error editing message: {e}")
         await call.answer("⚠️ Помилка при оновленні.")
+
+
+def _is_owner(chat_id: int) -> bool:
+    return bool(config.DEFAULT_CHAT_ID and chat_id == config.DEFAULT_CHAT_ID)
+
+
+async def _trigger_restart(api_client: ToeApiClient) -> tuple[bool, str]:
+    hook_url = config.RENDER_DEPLOY_HOOK_URL
+    if hook_url:
+        try:
+            session = await api_client.get_session()
+            async with session.post(hook_url) as resp:
+                if 200 <= resp.status < 300:
+                    return (
+                        True,
+                        "🔄 <b>Запущено оновлення та перезапуск бота на Render.</b>\n"
+                        "<i>Нова версія запрацює за 1–2 хвилини.</i>",
+                    )
+                body = await resp.text()
+                logger.warning(f"Render deploy hook returned HTTP {resp.status}: {body[:200]}")
+                return (
+                    False,
+                    f"⚠️ <b>Не вдалося викликати Render Deploy Hook (HTTP {resp.status}).</b>",
+                )
+        except Exception as e:
+            logger.warning(f"Failed to trigger Render deploy hook: {e}")
+            return False, "⚠️ <b>Помилка при виклику Render Deploy Hook.</b>"
+
+    asyncio.get_running_loop().call_later(1.0, os.kill, os.getpid(), signal.SIGTERM)
+    return (
+        True,
+        "🔄 <b>Перезапускаю процес бота...</b>\n"
+        "<i>Для автооновлення коду після push увімкніть Auto-Deploy на Render або задайте RENDER_DEPLOY_HOOK_URL.</i>",
+    )
 
 
 def _format_subscription_summary(sub: Optional[dict]) -> str:
@@ -493,7 +529,11 @@ async def handle_settings(message: Message):
         "⚙️ <b>Налаштування сповіщень та комфорту</b>\n\n"
         "Натискайте кнопки нижче для налаштування під себе:"
     )
-    await message.answer(text, reply_markup=get_settings_inline_keyboard(sub or {}), parse_mode="HTML")
+    await message.answer(
+        text,
+        reply_markup=get_settings_inline_keyboard(sub or {}, is_owner=_is_owner(chat_id)),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "toggle_subscription_pause")
@@ -511,7 +551,9 @@ async def cb_toggle_subscription_pause(call: CallbackQuery):
     updated_sub = await db.get_subscriber(chat_id)
     try:
         await call.message.edit_reply_markup(
-            reply_markup=get_settings_inline_keyboard(updated_sub or {})
+            reply_markup=get_settings_inline_keyboard(
+                updated_sub or {}, is_owner=_is_owner(chat_id)
+            )
         )
     except TelegramBadRequest:
         pass
@@ -538,7 +580,9 @@ async def cb_toggle_setting(call: CallbackQuery):
     updated_sub = await db.get_subscriber(chat_id)
     try:
         await call.message.edit_reply_markup(
-            reply_markup=get_settings_inline_keyboard(updated_sub or {})
+            reply_markup=get_settings_inline_keyboard(
+                updated_sub or {}, is_owner=_is_owner(chat_id)
+            )
         )
     except TelegramBadRequest:
         pass
@@ -566,12 +610,33 @@ async def cb_cycle_warning(call: CallbackQuery):
     updated_sub = await db.get_subscriber(chat_id)
     try:
         await call.message.edit_reply_markup(
-            reply_markup=get_settings_inline_keyboard(updated_sub or {})
+            reply_markup=get_settings_inline_keyboard(
+                updated_sub or {}, is_owner=_is_owner(chat_id)
+            )
         )
     except TelegramBadRequest:
         pass
     msg = f"Попередження: {new_val} хв" if new_val else "Попередження вимкнено"
     await call.answer(msg)
+
+
+@router.message(Command("restart"))
+async def cmd_restart(message: Message, api_client: ToeApiClient):
+    if not _is_owner(message.chat.id):
+        await message.answer("⛔️ Команда доступна лише власнику бота.")
+        return
+    _, response_text = await _trigger_restart(api_client)
+    await message.answer(response_text, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "restart_bot")
+async def cb_restart_bot(call: CallbackQuery, api_client: ToeApiClient):
+    if not _is_owner(call.message.chat.id):
+        await call.answer("⛔️ Команда доступна лише власнику бота.", show_alert=True)
+        return
+    ok, response_text = await _trigger_restart(api_client)
+    await call.answer("🔄 Перезапуск..." if ok else "⚠️ Помилка", show_alert=False)
+    await call.message.answer(response_text, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "close_settings")

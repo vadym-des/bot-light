@@ -1,0 +1,25 @@
+name: Auto-Deploy Bot on Push
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Trigger Render Deploy Hook
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render redeploy and restart
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL secret is not set; skipping deploy hook."
+            echo "Tip: Enable Render Auto-Deploy on main or add RENDER_DEPLOY_HOOK_URL to GitHub Repository Secrets."
+            exit 0
+          fi
+          curl -fsS -m 30 -X POST "$RENDER_DEPLOY_HOOK_URL"
+          echo ""
+          echo "Render deploy hook triggered successfully."

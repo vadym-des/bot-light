@@ -111,7 +111,10 @@ def get_schedule_inline_keyboard(day: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def get_settings_inline_keyboard(user_settings: dict) -> InlineKeyboardMarkup:
+def get_settings_inline_keyboard(
+    user_settings: dict,
+    is_owner: bool = False,
+) -> InlineKeyboardMarkup:
     """
     Interactive toggle buttons for notification preferences.
     """
@@ -178,8 +181,12 @@ def get_settings_inline_keyboard(user_settings: dict) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📌 Закріпити живий статус", callback_data="pin_live_status")
         ],
-        [
-            InlineKeyboardButton(text="🔙 Закрити налаштування", callback_data="close_settings")
-        ],
     ]
+    if is_owner:
+        keyboard.append([
+            InlineKeyboardButton(text="🔄 Перезапустити бота", callback_data="restart_bot")
+        ])
+    keyboard.append([
+        InlineKeyboardButton(text="🔙 Закрити налаштування", callback_data="close_settings")
+    ])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)

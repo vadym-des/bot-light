@@ -969,6 +969,76 @@ class TestHandlersAndKeyboards(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/api/info", src)
         self.assertIn("/health", src)
 
+    def test_restart_button_only_visible_to_owner(self):
+        kb_user = keyboards.get_settings_inline_keyboard({}, is_owner=False)
+        cbs_user = [btn.callback_data for row in kb_user.inline_keyboard for btn in row if btn.callback_data]
+        self.assertNotIn("restart_bot", cbs_user)
+
+        kb_owner = keyboards.get_settings_inline_keyboard({}, is_owner=True)
+        cbs_owner = [btn.callback_data for row in kb_owner.inline_keyboard for btn in row if btn.callback_data]
+        self.assertIn("restart_bot", cbs_owner)
+
+    async def test_restart_command_and_callback_owner_only_and_deploy_hook(self):
+        api = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.status = 200
+        fake_resp.text = AsyncMock(return_value="ok")
+        post_ctx = MagicMock()
+        post_ctx.__aenter__ = AsyncMock(return_value=fake_resp)
+        post_ctx.__aexit__ = AsyncMock(return_value=False)
+        fake_session = MagicMock()
+        fake_session.post = MagicMock(return_value=post_ctx)
+        api.get_session = AsyncMock(return_value=fake_session)
+
+        # Non-owner rejected for both command and callback
+        non_owner_msg = MagicMock()
+        non_owner_msg.chat = SimpleNamespace(id=999)
+        non_owner_msg.answer = AsyncMock()
+
+        non_owner_call = MagicMock()
+        non_owner_call.message = MagicMock()
+        non_owner_call.message.chat = SimpleNamespace(id=999)
+        non_owner_call.message.answer = AsyncMock()
+        non_owner_call.answer = AsyncMock()
+
+        with patch.object(config, "DEFAULT_CHAT_ID", 12345), patch.object(
+            config, "RENDER_DEPLOY_HOOK_URL", "https://api.render.com/deploy/srv-x?key=y"
+        ), patch.object(handlers.os, "kill") as mock_kill:
+            await handlers.cmd_restart(non_owner_msg, api_client=api)
+            await handlers.cb_restart_bot(non_owner_call, api_client=api)
+            self.assertIn("лише власнику", non_owner_msg.answer.await_args.args[0])
+            self.assertIn("лише власнику", non_owner_call.answer.await_args.args[0])
+            fake_session.post.assert_not_called()
+            mock_kill.assert_not_called()
+
+            # Owner with RENDER_DEPLOY_HOOK_URL triggers HTTP POST
+            owner_msg = MagicMock()
+            owner_msg.chat = SimpleNamespace(id=12345)
+            owner_msg.answer = AsyncMock()
+            await handlers.cmd_restart(owner_msg, api_client=api)
+            fake_session.post.assert_called_once_with("https://api.render.com/deploy/srv-x?key=y")
+            self.assertIn("Render", owner_msg.answer.await_args.args[0])
+            mock_kill.assert_not_called()
+
+        # Owner without deploy hook schedules SIGTERM via call_later
+        fake_loop = MagicMock()
+        owner_call = MagicMock()
+        owner_call.message = MagicMock()
+        owner_call.message.chat = SimpleNamespace(id=12345)
+        owner_call.message.answer = AsyncMock()
+        owner_call.answer = AsyncMock()
+
+        with patch.object(config, "DEFAULT_CHAT_ID", 12345), patch.object(
+            config, "RENDER_DEPLOY_HOOK_URL", ""
+        ), patch.object(handlers.asyncio, "get_running_loop", return_value=fake_loop):
+            await handlers.cb_restart_bot(owner_call, api_client=api)
+            fake_loop.call_later.assert_called_once()
+            args = fake_loop.call_later.call_args.args
+            self.assertEqual(args[0], 1.0)
+            self.assertIs(args[1], handlers.os.kill)
+            self.assertEqual(args[3], handlers.signal.SIGTERM)
+            self.assertIn("Перезапускаю", owner_call.message.answer.await_args.args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

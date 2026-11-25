@@ -61,6 +61,7 @@ class Config:
     DEFAULT_CHAT_ID: int = field(default_factory=lambda: _get_int_env("DEFAULT_CHAT_ID", 0))
     PORT: int = field(default_factory=lambda: _get_int_env("PORT", 10000))
     RENDER_EXTERNAL_URL: str = field(default_factory=lambda: _get_str_env("RENDER_EXTERNAL_URL", "").rstrip("/"))
+    RENDER_DEPLOY_HOOK_URL: str = field(default_factory=lambda: _get_str_env("RENDER_DEPLOY_HOOK_URL", ""))
     BOT_USERNAME: str = field(default_factory=lambda: _get_str_env("BOT_USERNAME", "").lstrip("@"))
 
     @property
