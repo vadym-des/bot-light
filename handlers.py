@@ -210,6 +210,32 @@ def _format_subscription_summary(sub: Optional[dict]) -> str:
     )
 
 
+async def _send_fresh_status(
+    chat_id: int,
+    bot,
+    send_fn,
+    api_client: ToeApiClient,
+    sub: Optional[dict] = None,
+) -> None:
+    """Deletes the previous status card (if any), sends a fresh one, and persists its message_id."""
+    if sub is None:
+        sub = await db.get_subscriber(chat_id)
+
+    if sub and sub.get("last_status_message_id"):
+        try:
+            await bot.delete_message(chat_id, sub["last_status_message_id"])
+        except Exception:
+            pass
+
+    status_text = await build_status_message(api_client)
+    sent_msg = await send_fn(
+        status_text,
+        reply_markup=get_status_inline_keyboard(is_pinned=False),
+        parse_mode="HTML",
+    )
+    await db.update_setting(chat_id, "last_status_message_id", sent_msg.message_id)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, api_client: ToeApiClient):
     chat_id = message.chat.id
@@ -223,12 +249,6 @@ async def cmd_start(message: Message, api_client: ToeApiClient):
 
     await db.add_subscriber(chat_id, username, raw_name, reactivate=True)
     sub = await db.get_subscriber(chat_id)
-
-    if sub and sub.get("last_status_message_id"):
-        try:
-            await message.bot.delete_message(chat_id, sub["last_status_message_id"])
-        except Exception:
-            pass
 
     safe_name = html.escape(raw_name)
     summary = _format_subscription_summary(sub)
@@ -244,13 +264,7 @@ async def cmd_start(message: Message, api_client: ToeApiClient):
     )
 
     await message.answer(greeting, reply_markup=get_main_reply_keyboard(), parse_mode="HTML")
-    status_text = await build_status_message(api_client)
-    sent_msg = await message.answer(
-        status_text,
-        reply_markup=get_status_inline_keyboard(is_pinned=False),
-        parse_mode="HTML",
-    )
-    await db.update_setting(chat_id, "last_status_message_id", sent_msg.message_id)
+    await _send_fresh_status(chat_id, message.bot, message.answer, api_client, sub=sub)
 
 
 @router.message(Command("stop", "unsubscribe"))
@@ -277,42 +291,12 @@ async def cmd_stop(message: Message):
 
 @router.message(or_f(Command("status", "now"), F.text == "💡 Поточний стан"))
 async def handle_status(message: Message, api_client: ToeApiClient):
-    chat_id = message.chat.id
-    sub = await db.get_subscriber(chat_id)
-
-    if sub and sub.get("last_status_message_id"):
-        try:
-            await message.bot.delete_message(chat_id, sub["last_status_message_id"])
-        except Exception:
-            pass
-
-    status_text = await build_status_message(api_client)
-    sent_msg = await message.answer(
-        status_text,
-        reply_markup=get_status_inline_keyboard(is_pinned=False),
-        parse_mode="HTML",
-    )
-    await db.update_setting(chat_id, "last_status_message_id", sent_msg.message_id)
+    await _send_fresh_status(message.chat.id, message.bot, message.answer, api_client)
 
 
 @router.callback_query(F.data == "btn_status")
 async def cb_btn_status(call: CallbackQuery, api_client: ToeApiClient):
-    chat_id = call.message.chat.id
-    sub = await db.get_subscriber(chat_id)
-
-    if sub and sub.get("last_status_message_id"):
-        try:
-            await call.bot.delete_message(chat_id, sub["last_status_message_id"])
-        except Exception:
-            pass
-
-    status_text = await build_status_message(api_client)
-    sent_msg = await call.message.answer(
-        status_text,
-        reply_markup=get_status_inline_keyboard(is_pinned=False),
-        parse_mode="HTML",
-    )
-    await db.update_setting(chat_id, "last_status_message_id", sent_msg.message_id)
+    await _send_fresh_status(call.message.chat.id, call.bot, call.message.answer, api_client)
     await call.answer()
 
 
@@ -441,23 +425,36 @@ async def handle_accidents(message: Message, api_client: ToeApiClient):
         if accidents_raw is not None
         else []
     )
+    real_accidents = [a for a in accidents if not ScheduleParser.is_gpv_accident(a)]
+    gpv_accidents = [a for a in accidents if ScheduleParser.is_gpv_accident(a)]
     planed = (
         ScheduleParser.filter_accidents_for_building(planed_raw, config.BUILDING_NAME)
         if planed_raw is not None
         else []
     )
 
-    if not accidents and not planed and accidents_raw is not None and planed_raw is not None:
+    if not real_accidents and not planed and accidents_raw is not None and planed_raw is not None:
         lines.append("✅ <b>Аварійних або планових ремонтних робіт за вашою адресою не зафіксовано.</b>")
-        lines.append("Мережа працює в штатному режимі.")
+        if gpv_accidents:
+            lines.append("\n⚡️ <b>Зараз діє погодинне відключення (ГПВ):</b>")
+            for g in gpv_accidents:
+                lines.append(ScheduleParser.format_accident_line(g, is_planned=False))
+        else:
+            lines.append("Мережа працює в штатному режимі.")
     else:
         if accidents_raw is None:
             lines.append("⚠️ <i>Не вдалося перевірити аварійні відключення (помилка API).</i>\n")
-        elif accidents:
-            lines.append("⚠️ <b>Аварійні відключення:</b>")
-            for a in accidents:
-                lines.append(ScheduleParser.format_accident_line(a, is_planned=False))
-            lines.append("")
+        else:
+            if real_accidents:
+                lines.append("⚠️ <b>Аварійні відключення:</b>")
+                for a in real_accidents:
+                    lines.append(ScheduleParser.format_accident_line(a, is_planned=False))
+                lines.append("")
+            if gpv_accidents:
+                lines.append("⚡️ <b>Погодинне відключення (ГПВ):</b>")
+                for g in gpv_accidents:
+                    lines.append(ScheduleParser.format_accident_line(g, is_planned=False))
+                lines.append("")
 
         if planed_raw is None:
             lines.append("⚠️ <i>Не вдалося перевірити планові ремонти (помилка API).</i>\n")
@@ -467,7 +464,7 @@ async def handle_accidents(message: Message, api_client: ToeApiClient):
                 lines.append(ScheduleParser.format_accident_line(p, is_planned=True))
             lines.append("")
 
-        if (accidents_raw is None or planed_raw is None) and not accidents and not planed:
+        if (accidents_raw is None or planed_raw is None) and not real_accidents and not gpv_accidents and not planed:
             lines.append("<i>За доступним розділом робіт не зафіксовано.</i>")
 
     await message.answer("\n".join(lines), parse_mode="HTML")

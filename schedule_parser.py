@@ -1,3 +1,4 @@
+import hashlib
 import html
 import logging
 import re
@@ -41,6 +42,8 @@ _HOMOGLYPH_TRANS = str.maketrans({
 })
 
 _TZ_SUFFIX_RE = re.compile(r"(?:Z|[+-]\d{2}:?\d{2})$", re.IGNORECASE)
+_GPV_COMMENT_RE = re.compile(r"(?:^|[^а-яіїєґa-z0-9])гпв(?:$|[^а-яіїєґa-z0-9])|погодинн", re.IGNORECASE)
+_EMERGENCY_COMMENT_RE = re.compile(r"(?:^|[^а-яіїєґa-z0-9])с?гав(?:$|[^а-яіїєґa-z0-9])|аварійн", re.IGNORECASE)
 
 
 def _safe_int(val: Any, default: int = 0) -> int:
@@ -269,10 +272,22 @@ class ScheduleParser:
         return ""
 
     @staticmethod
+    def _format_date_graph(date_graph: Any) -> str:
+        """Formats an API dateGraph string into DD.MM.YYYY."""
+        if not date_graph:
+            return ""
+        try:
+            d = datetime.fromisoformat(str(date_graph).replace("Z", "+00:00"))
+            return d.strftime("%d.%m.%Y")
+        except Exception:
+            return str(date_graph)[:10]
+
+    @staticmethod
     def format_schedule_text(
         day_schedule: Dict[str, Any],
         title_prefix: str = "сьогодні",
         dt: Optional[datetime] = None,
+        include_header: bool = True,
     ) -> str:
         """
         Builds a clean, logical, human-friendly HTML message describing the schedule for a given day.
@@ -281,13 +296,7 @@ class ScheduleParser:
         date_graph = day_schedule.get("dateGraph", "")
         group = day_schedule.get("group", config.CHER_GPV)
 
-        formatted_date = ""
-        if date_graph:
-            try:
-                d = datetime.fromisoformat(str(date_graph).replace("Z", "+00:00"))
-                formatted_date = d.strftime("%d.%m.%Y")
-            except Exception:
-                formatted_date = str(date_graph)[:10]
+        formatted_date = ScheduleParser._format_date_graph(date_graph)
 
         if dt is None:
             tz = ZoneInfo(config.TIMEZONE)
@@ -300,10 +309,12 @@ class ScheduleParser:
         off_intervals = [i for i in intervals if i["status"] == STATUS_OFF]
         maybe_intervals = [i for i in intervals if i["status"] == STATUS_MAYBE]
 
-        lines = [
-            f"📅 <b>Графік на {html.escape(title_prefix)} ({html.escape(formatted_date)})</b>",
-            f"📍 {html.escape(config.short_address)} (Черга {html.escape(str(group))})\n",
-        ]
+        lines: List[str] = []
+        if include_header:
+            lines.extend([
+                f"📅 <b>Графік на {html.escape(title_prefix)} ({html.escape(formatted_date)})</b>",
+                f"📍 {html.escape(config.short_address)} (Черга {html.escape(str(group))})\n",
+            ])
 
         if not off_intervals and not maybe_intervals:
             lines.append("🎉 <b>Відключень не заплановано! Світло буде весь день 🟢</b>\n")
@@ -576,14 +587,7 @@ class ScheduleParser:
         Builds a compact morning overview for the daily digest.
         """
         times = day_schedule.get("times", {})
-        date_graph = day_schedule.get("dateGraph", "")
-        formatted_date = ""
-        if date_graph:
-            try:
-                d = datetime.fromisoformat(str(date_graph).replace("Z", "+00:00"))
-                formatted_date = d.strftime("%d.%m.%Y")
-            except Exception:
-                formatted_date = str(date_graph)[:10]
+        formatted_date = ScheduleParser._format_date_graph(day_schedule.get("dateGraph", ""))
 
         intervals = ScheduleParser.get_intervals(times)
         off_intervals = [i for i in intervals if i["status"] == STATUS_OFF]
@@ -684,3 +688,25 @@ class ScheduleParser:
             start_str = html.escape(ScheduleParser.format_toe_datetime(raw_start))
             return f"• {safe_desc} ({start_str} — {end_str})"
         return f"• {safe_desc} (до {end_str})"
+
+    @staticmethod
+    def is_gpv_accident(record: Dict[str, Any]) -> bool:
+        """Returns True when a pw_accidents entry reflects a scheduled GPV outage rather than an emergency."""
+        raw_desc = record.get("koment") or record.get("reason") or ""
+        desc = re.sub(r"\s+", " ", str(raw_desc)).strip()
+        if not desc or _EMERGENCY_COMMENT_RE.search(desc):
+            return False
+        return bool(_GPV_COMMENT_RE.search(desc))
+
+    @staticmethod
+    def accident_fingerprint(record: Dict[str, Any]) -> str:
+        """Builds a stable semantic fingerprint ignoring ephemeral TOE row IDs and building lists."""
+        raw_desc = record.get("koment") or record.get("reason") or ""
+        desc = re.sub(r"\s+", " ", str(raw_desc)).strip().lower()
+        start_str = ScheduleParser.format_toe_datetime(
+            record.get("dateEvent") or record.get("dateStart")
+        )
+        end_str = ScheduleParser.format_toe_datetime(
+            record.get("datePlanIn") or record.get("dateEnd")
+        )
+        return hashlib.md5(f"{desc}|{start_str}|{end_str}".encode("utf-8")).hexdigest()

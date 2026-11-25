@@ -171,24 +171,32 @@ class NotifierService:
 
             await asyncio.sleep(0.05)
 
-    @staticmethod
-    def _hash_records(records: List[Dict[str, Any]]) -> str:
-        payload = sorted(
-            [
-                {
-                    "id": r.get("id"),
-                    "dateEvent": r.get("dateEvent") or r.get("dateStart"),
-                    "datePlanIn": r.get("datePlanIn") or r.get("dateEnd"),
-                    "koment": r.get("koment") or r.get("reason"),
-                    "buildingNames": r.get("buildingNames"),
-                }
-                for r in records
-            ],
-            key=lambda x: (str(x.get("id") or ""), str(x.get("dateEvent") or "")),
-        )
-        return hashlib.md5(
-            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
+    async def _collect_new_records(
+        self,
+        records: List[Dict[str, Any]],
+        state_prefix: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Deduplicates accident/repair records by semantic fingerprint against persisted state,
+        marking newly seen records before broadcasting to prevent duplicate alerts on API resyncs.
+        """
+        if not records:
+            return []
+
+        sent_states = await db.get_states_by_prefix(state_prefix)
+        new_records: List[Dict[str, Any]] = []
+        seen_fps: set[str] = set()
+
+        for rec in records:
+            fp = ScheduleParser.accident_fingerprint(rec)
+            state_key = f"{state_prefix}{fp}"
+            if fp in seen_fps or state_key in sent_states:
+                continue
+            seen_fps.add(fp)
+            await db.set_state(state_key, "1")
+            new_records.append(rec)
+
+        return new_records
 
     async def _check_accidents_and_planned(
         self,
@@ -200,53 +208,47 @@ class NotifierService:
         safe_addr = html.escape(config.short_address)
 
         if accidents_raw is not None:
-            accidents = ScheduleParser.filter_accidents_for_building(
-                accidents_raw, config.BUILDING_NAME
-            )
-            saved_acc_hash = await db.get_state("active_accidents_hash")
-            if accidents:
-                acc_hash = self._hash_records(accidents)
-                if saved_acc_hash != acc_hash:
-                    await db.set_state("active_accidents_hash", acc_hash)
-                    lines = [
-                        "🚨 <b>Увага! Зафіксовано аварійне відключення</b>",
-                        f"📍 {safe_addr}\n",
-                    ]
-                    for a in accidents:
-                        lines.append(ScheduleParser.format_accident_line(a, is_planned=False))
-                    lines.append("\n⚠️ Електропостачання призупинено через аварію.")
-                    await self.broadcast(
-                        "\n".join(lines),
-                        filter_key="notify_outage",
-                        subscribers=subscribers,
-                        now=now,
-                    )
-            elif saved_acc_hash:
-                await db.set_state("active_accidents_hash", "")
+            accidents = [
+                a
+                for a in ScheduleParser.filter_accidents_for_building(
+                    accidents_raw, config.BUILDING_NAME
+                )
+                if not ScheduleParser.is_gpv_accident(a)
+            ]
+            new_accidents = await self._collect_new_records(accidents, "acc_sent_")
+            if new_accidents:
+                lines = [
+                    "🚨 <b>Увага! Зафіксовано аварійне відключення</b>",
+                    f"📍 {safe_addr}\n",
+                ]
+                for a in new_accidents:
+                    lines.append(ScheduleParser.format_accident_line(a, is_planned=False))
+                lines.append("\n⚠️ Електропостачання призупинено через аварію.")
+                await self.broadcast(
+                    "\n".join(lines),
+                    filter_key="notify_outage",
+                    subscribers=subscribers,
+                    now=now,
+                )
 
         if planed_raw is not None:
             planed = ScheduleParser.filter_accidents_for_building(
                 planed_raw, config.BUILDING_NAME
             )
-            saved_planed_hash = await db.get_state("active_planed_accidents_hash")
-            if planed:
-                planed_hash = self._hash_records(planed)
-                if saved_planed_hash != planed_hash:
-                    await db.set_state("active_planed_accidents_hash", planed_hash)
-                    lines = [
-                        "🛠 <b>Зафіксовано планові ремонтні роботи</b>",
-                        f"📍 {safe_addr}\n",
-                    ]
-                    for p in planed:
-                        lines.append(ScheduleParser.format_accident_line(p, is_planned=True))
-                    await self.broadcast(
-                        "\n".join(lines),
-                        filter_key="notify_schedule_change",
-                        subscribers=subscribers,
-                        now=now,
-                    )
-            elif saved_planed_hash:
-                await db.set_state("active_planed_accidents_hash", "")
+            new_planed = await self._collect_new_records(planed, "planed_sent_")
+            if new_planed:
+                lines = [
+                    "🛠 <b>Зафіксовано планові ремонтні роботи</b>",
+                    f"📍 {safe_addr}\n",
+                ]
+                for p in new_planed:
+                    lines.append(ScheduleParser.format_accident_line(p, is_planned=True))
+                await self.broadcast(
+                    "\n".join(lines),
+                    filter_key="notify_schedule_change",
+                    subscribers=subscribers,
+                    now=now,
+                )
 
     async def _check_schedule_changes(
         self,
@@ -267,17 +269,19 @@ class NotifierService:
 
         safe_addr = html.escape(config.short_address)
         safe_group = html.escape(config.CHER_GPV)
+        formatted_date = ScheduleParser._format_date_graph(day_sched.get("dateGraph", ""))
+        date_suffix = f" ({html.escape(formatted_date)})" if formatted_date else ""
 
         if saved_hash is None:
             await db.set_state(hash_key, new_hash)
             if is_tomorrow:
                 schedule_text = ScheduleParser.format_schedule_text(
-                    day_sched, "завтра (НОВИЙ)", dt=now
+                    day_sched, "завтра (НОВИЙ)", dt=now, include_header=False
                 )
                 header = (
-                    "📆 <b>Оприлюднено графік відключень на завтра!</b>"
+                    f"📆 <b>Оприлюднено графік відключень на завтра{date_suffix}!</b>"
                     if has_outages
-                    else "📆 <b>Оприлюднено графік на завтра (без відключень)!</b>"
+                    else f"📆 <b>Оприлюднено графік на завтра{date_suffix} (без відключень)!</b>"
                 )
                 msg = f"{header}\n📍 {safe_addr} (Черга {safe_group})\n\n{schedule_text}"
                 await self.broadcast(
@@ -288,10 +292,10 @@ class NotifierService:
                 )
             elif has_outages:
                 schedule_text = ScheduleParser.format_schedule_text(
-                    day_sched, "сьогодні", dt=now
+                    day_sched, "сьогодні", dt=now, include_header=False
                 )
                 msg = (
-                    "📆 <b>Оприлюднено графік відключень на сьогодні!</b>\n"
+                    f"📆 <b>Оприлюднено графік відключень на сьогодні{date_suffix}!</b>\n"
                     f"📍 {safe_addr} (Черга {safe_group})\n\n"
                     f"{schedule_text}"
                 )
@@ -307,21 +311,21 @@ class NotifierService:
             await db.set_state(hash_key, new_hash)
             if is_tomorrow:
                 schedule_text = ScheduleParser.format_schedule_text(
-                    day_sched, "завтра (ОНОВЛЕНО)", dt=now
+                    day_sched, "завтра (ОНОВЛЕНО)", dt=now, include_header=False
                 )
                 header = (
-                    "🔄 <b>Оновлено графік відключень на завтра!</b>"
+                    f"🔄 <b>Оновлено графік відключень на завтра{date_suffix}!</b>"
                     if has_outages
-                    else "🔄 <b>Оновлено графік на завтра!</b>"
+                    else f"🔄 <b>Оновлено графік на завтра{date_suffix}!</b>"
                 )
             else:
                 schedule_text = ScheduleParser.format_schedule_text(
-                    day_sched, "сьогодні (ОНОВЛЕНО)", dt=now
+                    day_sched, "сьогодні (ОНОВЛЕНО)", dt=now, include_header=False
                 )
                 header = (
-                    "🔄 <b>Оновлено години відключень на сьогодні!</b>"
+                    f"🔄 <b>Оновлено години відключень на сьогодні{date_suffix}!</b>"
                     if has_outages
-                    else "🔄 <b>Оновлено графік на сьогодні!</b>"
+                    else f"🔄 <b>Оновлено графік на сьогодні{date_suffix}!</b>"
                 )
             msg = f"{header}\n📍 {safe_addr} (Черга {safe_group})\n\n{schedule_text}"
             await self.broadcast(
@@ -418,6 +422,7 @@ class NotifierService:
         if current_status == STATUS_OFF:
             if last_status != STATUS_OFF and not await db.get_state(alert_sent_key):
                 await db.set_state(alert_sent_key, "1")
+                await db.set_state("last_status", current_status)
                 end_time = curr_interval["end"] if curr_interval else "кінця інтервалу"
                 rem_minutes = (
                     max(0, curr_interval["end_minutes"] - curr_minutes) if curr_interval else 0
@@ -435,8 +440,7 @@ class NotifierService:
 
                 msg = (
                     f"🔴 <b>Світло вимкнено до {end_time}</b>{dur_suffix}\n"
-                    f"📍 {safe_addr} (Черга {safe_group})\n\n"
-                    f"💡 Орієнтовний час відновлення електроенергії — <b>{end_time}</b>."
+                    f"📍 {safe_addr} (Черга {safe_group})"
                 )
                 await self.broadcast(msg, filter_key="notify_outage", subscribers=subscribers, now=now)
 
@@ -448,6 +452,7 @@ class NotifierService:
                 next_outage_msg = f" (можливе вимкнення о {next_interval['start']})"
 
             if last_status == STATUS_OFF:
+                await db.set_state("last_status", current_status)
                 msg = (
                     f"🟢 <b>Світло увімкнено!</b>{next_outage_msg}\n"
                     f"📍 {safe_addr} (Черга {safe_group})\n\n"
@@ -455,6 +460,7 @@ class NotifierService:
                 )
                 await self.broadcast(msg, filter_key="notify_restore", subscribers=subscribers, now=now)
             elif last_status == STATUS_MAYBE:
+                await db.set_state("last_status", current_status)
                 msg = (
                     f"🟢 <b>Період можливого відключення завершився!</b>{next_outage_msg}\n"
                     f"📍 {safe_addr} (Черга {safe_group})\n\n"
@@ -465,15 +471,17 @@ class NotifierService:
         elif current_status == STATUS_MAYBE:
             if last_status != STATUS_MAYBE and not await db.get_state(alert_sent_key):
                 await db.set_state(alert_sent_key, "1")
+                await db.set_state("last_status", current_status)
                 end_time = curr_interval["end"] if curr_interval else "кінця інтервалу"
                 msg = (
                     f"🟡 <b>Період можливого відключення (до {end_time})</b>\n"
                     f"📍 {safe_addr} (Черга {safe_group})\n\n"
-                    f"⚠️ До <b>{end_time}</b> можливе відключення у разі перевищення лімітів."
+                    "⚠️ Можливе вимкнення у разі перевищення лімітів."
                 )
                 await self.broadcast(msg, filter_key="notify_outage", subscribers=subscribers, now=now)
 
-        await db.set_state("last_status", current_status)
+        if last_status != current_status:
+            await db.set_state("last_status", current_status)
 
         # --- Advance Warnings ---
         if current_status != STATUS_OFF:
@@ -541,7 +549,7 @@ class NotifierService:
                                 )
 
                             warning_msg = (
-                                f"{emoji} <b>Через {diff} хв {status_title} світла (до {inter['end']})</b>\n"
+                                f"{emoji} <b>Через {diff} хв {status_title} світла</b>\n"
                                 f"📍 {safe_addr} (Черга {safe_group})\n\n"
                                 f"{action_line}\n"
                                 "🔌 <i>Встигніть зарядити пристрої та закінчити справи!</i>"

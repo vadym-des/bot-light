@@ -689,6 +689,102 @@ class TestNotifier(unittest.IsolatedAsyncioTestCase):
         await self.service.check_for_updates(now=datetime(2026, 11, 24, 0, 1, tzinfo=KYIV_TZ))
         self.bot.send_message.assert_not_called()
 
+    async def test_accident_dedup_ignores_ephemeral_id_building_names_and_empty_flicker(self):
+        self.api.get_schedule = AsyncMock(return_value=[])
+        base_rec = {
+            "id": 115803819,
+            "buildingNames": "1, 2-А, 3",
+            "koment": "Обрив проводу",
+            "dateEvent": "2026-11-25T15:48:16+00:00",
+            "datePlanIn": "2026-11-25T20:00:00+00:00",
+        }
+        # Poll 1: initial accident -> 1 alert
+        self.api.get_accidents = AsyncMock(return_value=[base_rec])
+        await self.service.check_for_updates(now=datetime(2026, 11, 25, 17, 0, tzinfo=KYIV_TZ))
+        self.assertEqual(self.bot.send_message.await_count, 1)
+
+        # Poll 2: TOE resync assigns new ephemeral id and expands buildingNames -> 0 alerts
+        self.bot.send_message.reset_mock()
+        self.api.get_accidents = AsyncMock(
+            return_value=[{**base_rec, "id": 115810815, "buildingNames": "1, 2-А, 3, 99"}]
+        )
+        await self.service.check_for_updates(now=datetime(2026, 11, 25, 17, 3, tzinfo=KYIV_TZ))
+        self.bot.send_message.assert_not_called()
+
+        # Poll 3: temporary empty [] during TOE table truncate -> 0 alerts
+        self.api.get_accidents = AsyncMock(return_value=[])
+        await self.service.check_for_updates(now=datetime(2026, 11, 25, 17, 4, tzinfo=KYIV_TZ))
+        self.bot.send_message.assert_not_called()
+
+        # Poll 4: same record returns with yet another id -> still 0 alerts
+        self.api.get_accidents = AsyncMock(
+            return_value=[{**base_rec, "id": 115820000}]
+        )
+        await self.service.check_for_updates(now=datetime(2026, 11, 25, 17, 5, tzinfo=KYIV_TZ))
+        self.bot.send_message.assert_not_called()
+
+        # Poll 5: old record + brand new accident -> alert contains ONLY the new accident
+        self.api.get_accidents = AsyncMock(
+            return_value=[
+                {**base_rec, "id": 115820001},
+                {
+                    "id": 115820002,
+                    "buildingNames": "2-А",
+                    "koment": "Аварія на ТП",
+                    "dateEvent": "2026-11-25T17:06:00+00:00",
+                    "datePlanIn": "2026-11-25T21:00:00+00:00",
+                },
+            ]
+        )
+        await self.service.check_for_updates(now=datetime(2026, 11, 25, 17, 6, tzinfo=KYIV_TZ))
+        self.assertEqual(self.bot.send_message.await_count, 1)
+        alert_text = self.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("Аварія на ТП", alert_text)
+        self.assertNotIn("Обрив проводу", alert_text)
+
+    async def test_gpv_in_pw_accidents_not_broadcast_as_emergency_but_gav_is(self):
+        self.api.get_schedule = AsyncMock(return_value=[])
+        self.api.get_accidents = AsyncMock(
+            return_value=[
+                {
+                    "id": 115803819,
+                    "buildingNames": "1, 2-А, 3",
+                    "koment": "Застосування ГПВ",
+                    "dateEvent": "2026-11-25T15:48:16+00:00",
+                    "datePlanIn": "2026-11-25T20:00:00+00:00",
+                }
+            ]
+        )
+        await self.service.check_for_updates(now=datetime(2026, 11, 25, 17, 0, tzinfo=KYIV_TZ))
+        self.bot.send_message.assert_not_called()
+
+        # Emergency ГАВ MUST still broadcast
+        self.api.get_accidents = AsyncMock(
+            return_value=[
+                {
+                    "id": 115803820,
+                    "buildingNames": "1, 2-А, 3",
+                    "koment": "Застосування ГАВ",
+                    "dateEvent": "2026-11-25T17:10:00+00:00",
+                    "datePlanIn": "2026-11-25T20:00:00+00:00",
+                }
+            ]
+        )
+        await self.service.check_for_updates(now=datetime(2026, 11, 25, 17, 10, tzinfo=KYIV_TZ))
+        self.assertEqual(self.bot.send_message.await_count, 1)
+        self.assertIn("Застосування ГАВ", self.bot.send_message.await_args.kwargs["text"])
+
+    async def test_schedule_change_broadcast_does_not_duplicate_address_or_header(self):
+        tmrw_times = make_times({"10:00": STATUS_OFF, "10:30": STATUS_OFF})
+        self.api.get_schedule = AsyncMock(
+            return_value=[make_graph("2026-11-26", tmrw_times)]
+        )
+        await self.service.check_for_updates(now=datetime(2026, 11, 25, 19, 0, tzinfo=KYIV_TZ))
+        self.assertEqual(self.bot.send_message.await_count, 1)
+        msg = self.bot.send_message.await_args.kwargs["text"]
+        self.assertEqual(msg.count(config.short_address), 1)
+        self.assertIn("26.11.2026", msg)
+
 
 class TestHandlersAndKeyboards(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -810,6 +906,29 @@ class TestHandlersAndKeyboards(unittest.IsolatedAsyncioTestCase):
         text = msg.answer.await_args.args[0]
         self.assertIn("Не вдалося перевірити", text)
         self.assertNotIn("штатному режимі", text)
+
+    async def test_accidents_handler_separates_gpv_from_emergency(self):
+        api = MagicMock()
+        api.get_accidents = AsyncMock(
+            return_value=[
+                {
+                    "id": 115803819,
+                    "buildingNames": "1, 2-А, 3",
+                    "koment": "Застосування ГПВ",
+                    "dateEvent": "2026-11-25T15:48:16+00:00",
+                    "datePlanIn": "2026-11-25T20:00:00+00:00",
+                }
+            ]
+        )
+        api.get_planed_accidents = AsyncMock(return_value=[])
+
+        msg = MagicMock()
+        msg.answer = AsyncMock()
+        await handlers.handle_accidents(msg, api_client=api)
+        text = msg.answer.await_args.args[0]
+        self.assertIn("Аварійних або планових ремонтних робіт за вашою адресою не зафіксовано", text)
+        self.assertIn("погодинне відключення (ГПВ)", text)
+        self.assertNotIn("Аварійні відключення:", text)
 
     async def test_pause_toggle_and_refresh_callbacks(self):
         await self.test_db.add_subscriber(666, username="u666", first_name="U666")
