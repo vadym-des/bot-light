@@ -653,7 +653,9 @@ async def cmd_restart(message: Message, api_client: ToeApiClient):
     if not _is_owner(message.chat.id):
         await message.answer("⛔️ Команда доступна лише власнику бота.")
         return
-    _, response_text = await _trigger_restart(api_client)
+    ok, response_text = await _trigger_restart(api_client)
+    if ok:
+        await db.set_state("pending_restart_notify_chat_id", str(message.chat.id))
     await message.answer(response_text, parse_mode="HTML")
 
 
@@ -663,6 +665,8 @@ async def cb_restart_bot(call: CallbackQuery, api_client: ToeApiClient):
         await call.answer("⛔️ Команда доступна лише власнику бота.", show_alert=True)
         return
     ok, response_text = await _trigger_restart(api_client)
+    if ok:
+        await db.set_state("pending_restart_notify_chat_id", str(call.message.chat.id))
     await call.answer("🔄 Перезапуск..." if ok else "⚠️ Помилка", show_alert=False)
     await call.message.answer(response_text, parse_mode="HTML")
 

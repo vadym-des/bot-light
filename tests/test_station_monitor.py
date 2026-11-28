@@ -183,7 +183,7 @@ class TestStationHttpAndBroadcast(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.bot.send_message.await_count, 1)
                 sent_kwargs = self.bot.send_message.await_args.kwargs
                 self.assertEqual(sent_kwargs["chat_id"], 1001)
-                self.assertIn("Світло зникло (факт)", sent_kwargs["text"])
+                self.assertIn("Світло зникло", sent_kwargs["text"])
 
                 # 6. Transition back to present -> broadcasts restore to all active subscribers with notify_restore=1
                 self.bot.send_message.reset_mock()
@@ -196,7 +196,7 @@ class TestStationHttpAndBroadcast(unittest.IsolatedAsyncioTestCase):
                 sent_chats = {call.kwargs["chat_id"] for call in self.bot.send_message.await_args_list}
                 self.assertEqual(sent_chats, {1001, 1002})
                 for call in self.bot.send_message.await_args_list:
-                    self.assertIn("Світло з'явилося (факт)", call.kwargs["text"])
+                    self.assertIn("Світло є", call.kwargs["text"])
 
         monitor.stop()
 
@@ -231,7 +231,143 @@ class TestStationHttpAndBroadcast(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.bot.send_message.await_count, 0)
                 await asyncio.sleep(1.2)
                 self.assertEqual(self.bot.send_message.await_count, 1)
-                self.assertIn("Світло зникло (факт)", self.bot.send_message.await_args.kwargs["text"])
+                self.assertIn("Світло зникло", self.bot.send_message.await_args.kwargs["text"])
+
+        monitor.stop()
+
+    async def test_station_1line_context_single_source_of_truth_and_past_schedule_filter(self):
+        import hashlib
+        import json as json_mod
+
+        times = _make_times(
+            {
+                "10:00": STATUS_MAYBE,
+                "10:30": STATUS_OFF,
+                "11:00": STATUS_OFF,
+                "11:30": STATUS_OFF,
+                "12:00": STATUS_OFF,
+                "12:30": STATUS_OFF,
+                "13:00": STATUS_MAYBE,
+                "18:00": STATUS_OFF,
+                "18:30": STATUS_OFF,
+            }
+        )
+        graph = {
+            "id": 1,
+            "dateGraph": "2026-11-28T00:00:00Z",
+            "dateCreate": "2026-11-28T08:00:00Z",
+            "dataJson": {"2.1": {"times": times}},
+        }
+        self.api_client.get_schedule = AsyncMock(return_value=[graph])
+        self.api_client.get_accidents = AsyncMock(return_value=[])
+        self.api_client.get_planed_accidents = AsyncMock(return_value=[])
+
+        monitor = StationMonitor(ttl_seconds=180, debounce_seconds=0)
+        notifier = NotifierService(
+            bot=self.bot,
+            api_client=self.api_client,
+            station_monitor=monitor,
+        )
+
+        with patch.object(notifier_module, "db", self.test_db):
+            # 1. Absent earlier than schedule (10:15, OFF starts at 10:30..13:00)
+            await notifier.handle_station_transition(
+                "absent", now=datetime(2026, 11, 28, 10, 15, tzinfo=KYIV_TZ)
+            )
+            self.assertEqual(
+                self.bot.send_message.await_args.kwargs["text"],
+                "🔴 <b>Світло зникло — раніше графіка (до 13:00)</b>",
+            )
+
+            # 2. Absent during scheduled OFF (11:00)
+            self.bot.send_message.reset_mock()
+            await notifier.handle_station_transition(
+                "absent", now=datetime(2026, 11, 28, 11, 0, tzinfo=KYIV_TZ)
+            )
+            self.assertEqual(
+                self.bot.send_message.await_args.kwargs["text"],
+                "🔴 <b>Світло зникло — до 13:00 (за графіком)</b>",
+            )
+
+            # 3. Absent outside schedule (15:00, next OFF at 18:00 > 60 min)
+            self.bot.send_message.reset_mock()
+            await notifier.handle_station_transition(
+                "absent", now=datetime(2026, 11, 28, 15, 0, tzinfo=KYIV_TZ)
+            )
+            self.assertEqual(
+                self.bot.send_message.await_args.kwargs["text"],
+                "🔴 <b>Світло зникло — поза графіком</b>",
+            )
+
+            # 4. Present at 13:02 -> next outage at 18:00
+            self.bot.send_message.reset_mock()
+            await notifier.handle_station_transition(
+                "present", now=datetime(2026, 11, 28, 13, 2, tzinfo=KYIV_TZ)
+            )
+            for call in self.bot.send_message.await_args_list:
+                self.assertEqual(
+                    call.kwargs["text"],
+                    "🟢 <b>Світло є — наступне вимкнення о 18:00</b>",
+                )
+
+            # 5. Present at 19:00 -> no more outages today
+            self.bot.send_message.reset_mock()
+            await notifier.handle_station_transition(
+                "present", now=datetime(2026, 11, 28, 19, 0, tzinfo=KYIV_TZ)
+            )
+            for call in self.bot.send_message.await_args_list:
+                self.assertEqual(
+                    call.kwargs["text"],
+                    "🟢 <b>Світло є — сьогодні більше без вимкнень</b>",
+                )
+
+            # 6. Seed schedule state, then test single-source-of-truth + warning suppression + past-only edit
+            await self.test_db.set_state(
+                "schedule_hash_2026-11-28",
+                hashlib.md5(json_mod.dumps(times, sort_keys=True).encode()).hexdigest(),
+            )
+            await self.test_db.set_state("schedule_times_2026-11-28", json_mod.dumps(times, sort_keys=True))
+
+            # Station reports absent at 10:15 -> 15-min warning for 10:30 OFF must be suppressed,
+            # AND scheduled transition at 10:30 must be suppressed because station is live.
+            self.bot.send_message.reset_mock()
+            monitor.record_update("absent", now_dt=datetime(2026, 11, 28, 10, 15, tzinfo=KYIV_TZ))
+            await notifier.check_for_updates(now=datetime(2026, 11, 28, 10, 15, tzinfo=KYIV_TZ))
+            await notifier.check_for_updates(now=datetime(2026, 11, 28, 10, 30, tzinfo=KYIV_TZ))
+            self.bot.send_message.assert_not_called()
+
+            # Past-only schedule edit at 14:00 (09:00 changed from ON to OFF) -> must NOT broadcast
+            past_edited = dict(times)
+            past_edited["09:00"] = STATUS_OFF
+            self.api_client.get_schedule = AsyncMock(
+                return_value=[
+                    {
+                        "id": 2,
+                        "dateGraph": "2026-11-28T00:00:00Z",
+                        "dateCreate": "2026-11-28T14:00:00Z",
+                        "dataJson": {"2.1": {"times": past_edited}},
+                    }
+                ]
+            )
+            await notifier.check_for_updates(now=datetime(2026, 11, 28, 14, 0, tzinfo=KYIV_TZ))
+            self.bot.send_message.assert_not_called()
+
+            # Future schedule edit at 14:05 (16:00 changed to OFF) -> MUST broadcast
+            future_edited = dict(past_edited)
+            future_edited["16:00"] = STATUS_OFF
+            self.api_client.get_schedule = AsyncMock(
+                return_value=[
+                    {
+                        "id": 3,
+                        "dateGraph": "2026-11-28T00:00:00Z",
+                        "dateCreate": "2026-11-28T14:05:00Z",
+                        "dataJson": {"2.1": {"times": future_edited}},
+                    }
+                ]
+            )
+            await notifier.check_for_updates(now=datetime(2026, 11, 28, 14, 5, tzinfo=KYIV_TZ))
+            self.assertEqual(self.bot.send_message.await_count, 2)
+            self.assertIn("Графік на сьогодні", self.bot.send_message.await_args.kwargs["text"])
 
         monitor.stop()
 

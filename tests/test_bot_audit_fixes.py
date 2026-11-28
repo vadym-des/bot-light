@@ -561,7 +561,7 @@ class TestNotifier(unittest.IsolatedAsyncioTestCase):
         await self.service.check_for_updates(now=datetime(2026, 11, 24, 0, 0, tzinfo=KYIV_TZ))
         self.assertEqual(self.bot.send_message.await_count, 1)
         restore_msg = self.bot.send_message.await_args.kwargs["text"]
-        self.assertIn("Світло увімкнено!", restore_msg)
+        self.assertIn("Світло є", restore_msg)
 
     async def test_continuous_midnight_outage_no_double_alert_and_warning_at_2345(self):
         day1_on = make_times()
@@ -585,7 +585,7 @@ class TestNotifier(unittest.IsolatedAsyncioTestCase):
         await self.service.check_for_updates(now=datetime(2026, 11, 23, 23, 45, tzinfo=KYIV_TZ))
         self.assertEqual(self.bot.send_message.await_count, 1)
         warn_msg = self.bot.send_message.await_args.kwargs["text"]
-        self.assertIn("Через 15 хв відключення", warn_msg)
+        self.assertIn("Через 15 хв вимкнення", warn_msg)
         self.assertIn("00:00", warn_msg)
 
         # Now test continuous 23:00-24:00 + 00:00-01:00 OFF does not double alert at 00:00
@@ -618,13 +618,16 @@ class TestNotifier(unittest.IsolatedAsyncioTestCase):
         await self.service.check_for_updates(now=datetime(2026, 11, 23, 10, 50, tzinfo=KYIV_TZ))
         self.bot.send_message.assert_not_called()
 
-        # At 11:30 user moved from STATUS_MAYBE to STATUS_ON
-        await self.test_db.set_state("last_status", STATUS_MAYBE)
+        # At 11:00 STATUS_MAYBE must NOT spam any yellow transition alert
+        await self.service.check_for_updates(now=datetime(2026, 11, 23, 11, 0, tzinfo=KYIV_TZ))
+        self.bot.send_message.assert_not_called()
+
+        # At 11:30 user moved to STATUS_ON after OFF -> sends 1 crisp restore alert
         await self.service.check_for_updates(now=datetime(2026, 11, 23, 11, 30, tzinfo=KYIV_TZ))
         self.assertEqual(self.bot.send_message.await_count, 1)
         msg = self.bot.send_message.await_args.kwargs["text"]
-        self.assertIn("Період можливого відключення завершився", msg)
-        self.assertNotIn("Електропостачання відновлено", msg)
+        self.assertIn("Світло є", msg)
+        self.assertNotIn("Період можливого відключення", msg)
 
     async def test_morning_digest_and_stale_pin_cleanup(self):
         await self.test_db.update_setting(1001, "pinned_message_id", 777)
@@ -1038,6 +1041,64 @@ class TestHandlersAndKeyboards(unittest.IsolatedAsyncioTestCase):
             self.assertIs(args[1], handlers.os.kill)
             self.assertEqual(args[3], handlers.signal.SIGTERM)
             self.assertIn("Перезапускаю", owner_call.message.answer.await_args.args[0])
+
+    async def test_restart_startup_confirmation_owner_only_and_one_shot(self):
+        api = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.status = 500
+        fake_resp.text = AsyncMock(return_value="fail")
+        post_ctx = MagicMock()
+        post_ctx.__aenter__ = AsyncMock(return_value=fake_resp)
+        post_ctx.__aexit__ = AsyncMock(return_value=False)
+        fake_session = MagicMock()
+        fake_session.post = MagicMock(return_value=post_ctx)
+        api.get_session = AsyncMock(return_value=fake_session)
+
+        owner_msg = MagicMock()
+        owner_msg.chat = SimpleNamespace(id=12345)
+        owner_msg.answer = AsyncMock()
+
+        # 1. Failed deploy hook must NOT arm restart confirmation
+        with patch.object(config, "DEFAULT_CHAT_ID", 12345), patch.object(
+            config, "RENDER_DEPLOY_HOOK_URL", "https://api.render.com/deploy/srv-x?key=y"
+        ):
+            await handlers.cmd_restart(owner_msg, api_client=api)
+            self.assertIsNone(await self.test_db.get_state("pending_restart_notify_chat_id"))
+
+        # 2. Successful restart arms pending_restart_notify_chat_id
+        fake_resp.status = 200
+        with patch.object(config, "DEFAULT_CHAT_ID", 12345), patch.object(
+            config, "RENDER_DEPLOY_HOOK_URL", "https://api.render.com/deploy/srv-x?key=y"
+        ):
+            await handlers.cmd_restart(owner_msg, api_client=api)
+            self.assertEqual(
+                await self.test_db.get_state("pending_restart_notify_chat_id"),
+                "12345",
+            )
+
+        # 3. On startup, notify_owner_restart_complete notifies owner ONCE and clears flag
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        with patch.object(main_module, "db", self.test_db), patch.object(
+            config, "DEFAULT_CHAT_ID", 12345
+        ):
+            await main_module.notify_owner_restart_complete(fake_bot)
+            fake_bot.send_message.assert_awaited_once()
+            kwargs = fake_bot.send_message.await_args.kwargs
+            self.assertEqual(kwargs["chat_id"], 12345)
+            self.assertIn("успішно перезапустився", kwargs["text"])
+            self.assertEqual(await self.test_db.get_state("pending_restart_notify_chat_id"), "")
+
+            # Second startup call does nothing
+            fake_bot.send_message.reset_mock()
+            await main_module.notify_owner_restart_complete(fake_bot)
+            fake_bot.send_message.assert_not_called()
+
+            # Non-owner chat id is rejected
+            await self.test_db.set_state("pending_restart_notify_chat_id", "99999")
+            await main_module.notify_owner_restart_complete(fake_bot)
+            fake_bot.send_message.assert_not_called()
+            self.assertEqual(await self.test_db.get_state("pending_restart_notify_chat_id"), "")
 
 
 if __name__ == "__main__":

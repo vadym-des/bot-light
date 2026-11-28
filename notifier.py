@@ -207,8 +207,6 @@ class NotifierService:
         subscribers: List[Dict[str, Any]],
         now: datetime,
     ) -> None:
-        safe_addr = html.escape(config.short_address)
-
         if accidents_raw is not None:
             accidents = [
                 a
@@ -219,13 +217,9 @@ class NotifierService:
             ]
             new_accidents = await self._collect_new_records(accidents, "acc_sent_")
             if new_accidents:
-                lines = [
-                    "🚨 <b>Увага! Зафіксовано аварійне відключення</b>",
-                    f"📍 {safe_addr}\n",
-                ]
+                lines = ["🚨 <b>Аварійне відключення:</b>"]
                 for a in new_accidents:
                     lines.append(ScheduleParser.format_accident_line(a, is_planned=False))
-                lines.append("\n⚠️ Електропостачання призупинено через аварію.")
                 await self.broadcast(
                     "\n".join(lines),
                     filter_key="notify_outage",
@@ -239,10 +233,7 @@ class NotifierService:
             )
             new_planed = await self._collect_new_records(planed, "planed_sent_")
             if new_planed:
-                lines = [
-                    "🛠 <b>Зафіксовано планові ремонтні роботи</b>",
-                    f"📍 {safe_addr}\n",
-                ]
+                lines = ["🛠 <b>Планові ремонтні роботи:</b>"]
                 for p in new_planed:
                     lines.append(ScheduleParser.format_accident_line(p, is_planned=True))
                 await self.broadcast(
@@ -251,6 +242,25 @@ class NotifierService:
                     subscribers=subscribers,
                     now=now,
                 )
+
+    @staticmethod
+    def _has_future_slot_changes(
+        saved_times: Dict[str, Any],
+        new_times: Dict[str, Any],
+        now: datetime,
+    ) -> bool:
+        current_slot_floor = now.hour * 60 + (0 if now.minute < 30 else 30)
+        for key in set(saved_times.keys()) | set(new_times.keys()):
+            parts = str(key).split(":")
+            if len(parts) != 2:
+                continue
+            try:
+                slot_minutes = int(parts[0]) * 60 + int(parts[1])
+            except ValueError:
+                continue
+            if slot_minutes >= current_slot_floor and saved_times.get(key) != new_times.get(key):
+                return True
+        return False
 
     async def _check_schedule_changes(
         self,
@@ -264,28 +274,30 @@ class NotifierService:
             return
 
         times = day_sched.get("times", {})
-        new_hash = hashlib.md5(json.dumps(times, sort_keys=True).encode("utf-8")).hexdigest()
+        times_json = json.dumps(times, sort_keys=True)
+        new_hash = hashlib.md5(times_json.encode("utf-8")).hexdigest()
         hash_key = f"schedule_hash_{date_str}"
+        times_key = f"schedule_times_{date_str}"
         saved_hash = await db.get_state(hash_key)
         has_outages = any(v in (STATUS_OFF, STATUS_MAYBE) for v in times.values())
 
         safe_addr = html.escape(config.short_address)
-        safe_group = html.escape(config.CHER_GPV)
         formatted_date = ScheduleParser._format_date_graph(day_sched.get("dateGraph", ""))
         date_suffix = f" ({html.escape(formatted_date)})" if formatted_date else ""
 
         if saved_hash is None:
             await db.set_state(hash_key, new_hash)
+            await db.set_state(times_key, times_json)
             if is_tomorrow:
                 schedule_text = ScheduleParser.format_schedule_text(
                     day_sched, "завтра (НОВИЙ)", dt=now, include_header=False
                 )
                 header = (
-                    f"📆 <b>Оприлюднено графік відключень на завтра{date_suffix}!</b>"
+                    f"📆 <b>Графік на завтра{date_suffix}</b>"
                     if has_outages
-                    else f"📆 <b>Оприлюднено графік на завтра{date_suffix} (без відключень)!</b>"
+                    else f"📆 <b>Графік на завтра{date_suffix} — без відключень</b>"
                 )
-                msg = f"{header}\n📍 {safe_addr} (Черга {safe_group})\n\n{schedule_text}"
+                msg = f"{header}\n📍 {safe_addr}\n\n{schedule_text}"
                 await self.broadcast(
                     msg,
                     filter_key="notify_schedule_change",
@@ -296,11 +308,7 @@ class NotifierService:
                 schedule_text = ScheduleParser.format_schedule_text(
                     day_sched, "сьогодні", dt=now, include_header=False
                 )
-                msg = (
-                    f"📆 <b>Оприлюднено графік відключень на сьогодні{date_suffix}!</b>\n"
-                    f"📍 {safe_addr} (Черга {safe_group})\n\n"
-                    f"{schedule_text}"
-                )
+                msg = f"📆 <b>Графік на сьогодні{date_suffix}</b>\n📍 {safe_addr}\n\n{schedule_text}"
                 await self.broadcast(
                     msg,
                     filter_key="notify_schedule_change",
@@ -308,34 +316,107 @@ class NotifierService:
                     now=now,
                 )
         elif saved_hash != new_hash:
+            saved_times_raw = await db.get_state(times_key)
+            await db.set_state(hash_key, new_hash)
+            await db.set_state(times_key, times_json)
+
+            if not is_tomorrow and saved_times_raw:
+                try:
+                    saved_times = json.loads(saved_times_raw)
+                except Exception:
+                    saved_times = None
+                if isinstance(saved_times, dict) and not self._has_future_slot_changes(
+                    saved_times, times, now
+                ):
+                    logger.info("Only past timeslots changed for today; skipping broadcast.")
+                    return
+
             day_label = "tomorrow" if is_tomorrow else "today"
             logger.info(f"{day_label.capitalize()} timeslots changed! Broadcasting notification...")
-            await db.set_state(hash_key, new_hash)
             if is_tomorrow:
                 schedule_text = ScheduleParser.format_schedule_text(
                     day_sched, "завтра (ОНОВЛЕНО)", dt=now, include_header=False
                 )
-                header = (
-                    f"🔄 <b>Оновлено графік відключень на завтра{date_suffix}!</b>"
-                    if has_outages
-                    else f"🔄 <b>Оновлено графік на завтра{date_suffix}!</b>"
-                )
+                header = f"🔄 <b>Графік на завтра{date_suffix} оновлено</b>"
             else:
                 schedule_text = ScheduleParser.format_schedule_text(
                     day_sched, "сьогодні (ОНОВЛЕНО)", dt=now, include_header=False
                 )
-                header = (
-                    f"🔄 <b>Оновлено години відключень на сьогодні{date_suffix}!</b>"
-                    if has_outages
-                    else f"🔄 <b>Оновлено графік на сьогодні{date_suffix}!</b>"
-                )
-            msg = f"{header}\n📍 {safe_addr} (Черга {safe_group})\n\n{schedule_text}"
+                header = f"🔄 <b>Графік на сьогодні{date_suffix} оновлено</b>"
+            msg = f"{header}\n📍 {safe_addr}\n\n{schedule_text}"
             await self.broadcast(
                 msg,
                 filter_key="notify_schedule_change",
                 subscribers=subscribers,
                 now=now,
             )
+
+    @staticmethod
+    def _resolve_schedule_context(
+        today_sched: Optional[Dict[str, Any]],
+        tomorrow_sched: Optional[Dict[str, Any]],
+        now: datetime,
+    ) -> Dict[str, Any]:
+        curr_minutes = now.hour * 60 + now.minute
+        t_first_off = None
+        if tomorrow_sched:
+            t_intervals = ScheduleParser.get_intervals(tomorrow_sched.get("times", {}))
+            if t_intervals and t_intervals[0]["start_minutes"] == 0 and t_intervals[0]["status"] == STATUS_OFF:
+                t_first_off = t_intervals[0]
+
+        if not today_sched:
+            return {
+                "curr_status": None,
+                "curr_interval": None,
+                "curr_off_end": None,
+                "curr_off_rem_minutes": 0,
+                "upcoming_off": None,
+                "near_upcoming_off": None,
+            }
+
+        times = today_sched.get("times", {})
+        intervals = ScheduleParser.get_intervals(times)
+        current_status_info = ScheduleParser.get_current_status(times, now)
+        curr_status = current_status_info["status"]
+        curr_interval = current_status_info["current_interval"]
+
+        curr_off_end = None
+        curr_off_rem_minutes = 0
+        if curr_status == STATUS_OFF and curr_interval:
+            curr_off_end = curr_interval["end"]
+            curr_off_rem_minutes = max(0, curr_interval["end_minutes"] - curr_minutes)
+            if curr_interval["end_minutes"] == 24 * 60 and t_first_off:
+                curr_off_end = f"{t_first_off['end']} (завтра)"
+                curr_off_rem_minutes = (24 * 60 - curr_minutes) + t_first_off["end_minutes"]
+
+        upcoming_off = None
+        for inter in intervals:
+            if inter["status"] == STATUS_OFF and inter["start_minutes"] > curr_minutes:
+                upcoming_off = dict(inter)
+                if upcoming_off["end_minutes"] == 24 * 60 and t_first_off:
+                    upcoming_off["end"] = f"{t_first_off['end']} (завтра)"
+                break
+
+        if upcoming_off is None and curr_minutes >= 23 * 60 and t_first_off:
+            upcoming_off = {
+                **t_first_off,
+                "start": "00:00",
+                "start_minutes": 24 * 60,
+                "end": f"{t_first_off['end']} (завтра)",
+            }
+
+        near_upcoming_off = None
+        if upcoming_off and (upcoming_off["start_minutes"] - curr_minutes) <= 60:
+            near_upcoming_off = upcoming_off
+
+        return {
+            "curr_status": curr_status,
+            "curr_interval": curr_interval,
+            "curr_off_end": curr_off_end,
+            "curr_off_rem_minutes": curr_off_rem_minutes,
+            "upcoming_off": upcoming_off,
+            "near_upcoming_off": near_upcoming_off,
+        }
 
     async def check_for_updates(self, now: Optional[datetime] = None):
         """
@@ -411,107 +492,67 @@ class NotifierService:
 
         times = today_sched.get("times", {})
         curr_minutes = now.hour * 60 + now.minute
-        safe_addr = html.escape(config.short_address)
-        safe_group = html.escape(config.CHER_GPV)
-
-        # --- Real-Time Status Transitions ---
-        current_status_info = ScheduleParser.get_current_status(times, now)
-        current_status = current_status_info["status"]
-        curr_interval = current_status_info["current_interval"]
-        next_interval = current_status_info["next_interval"]
+        sched_ctx = self._resolve_schedule_context(today_sched, tomorrow_sched, now)
+        current_status = sched_ctx["curr_status"]
+        curr_interval = sched_ctx["curr_interval"]
 
         last_status = await db.get_state("last_status")
         interval_start = curr_interval["start"] if curr_interval else "unknown"
         alert_sent_key = f"alert_sent_{today_str}_{interval_start}_{current_status}"
 
-        if current_status == STATUS_OFF:
-            if last_status != STATUS_OFF and not await db.get_state(alert_sent_key):
-                await db.set_state(alert_sent_key, "1")
+        station_live = physical_grid in ("present", "absent")
+
+        # --- Real-Time Status Transitions ---
+        if station_live:
+            # Station telemetry is the single source of truth; suppress schedule ON/OFF/MAYBE broadcasts.
+            if last_status is None and current_status in (STATUS_OFF, STATUS_ON):
                 await db.set_state("last_status", current_status)
-                end_time = curr_interval["end"] if curr_interval else "кінця інтервалу"
-                rem_minutes = (
-                    max(0, curr_interval["end_minutes"] - curr_minutes) if curr_interval else 0
-                )
+        else:
+            if current_status == STATUS_OFF:
+                if last_status != STATUS_OFF and not await db.get_state(alert_sent_key):
+                    await db.set_state(alert_sent_key, "1")
+                    await db.set_state("last_status", STATUS_OFF)
+                    end_time = sched_ctx["curr_off_end"] or "кінця інтервалу"
+                    rem_minutes = sched_ctx["curr_off_rem_minutes"]
+                    dur_str = format_duration(rem_minutes) if rem_minutes > 0 else ""
+                    dur_suffix = f" (на {dur_str})" if dur_str else ""
+                    msg = f"🔴 <b>Світло вимкнено до {end_time}</b>{dur_suffix}"
+                    await self.broadcast(msg, filter_key="notify_outage", subscribers=subscribers, now=now)
 
-                if curr_interval and curr_interval["end_minutes"] == 24 * 60 and tomorrow_sched:
-                    t_intervals = ScheduleParser.get_intervals(tomorrow_sched.get("times", {}))
-                    if t_intervals and t_intervals[0]["status"] == STATUS_OFF:
-                        t_first = t_intervals[0]
-                        end_time = f"{t_first['end']} (завтра)"
-                        rem_minutes = (24 * 60 - curr_minutes) + t_first["end_minutes"]
-
-                dur_str = format_duration(rem_minutes) if rem_minutes > 0 else ""
-                dur_suffix = f" (на {dur_str})" if dur_str else ""
-
-                msg = (
-                    f"🔴 <b>Світло вимкнено до {end_time}</b>{dur_suffix}\n"
-                    f"📍 {safe_addr} (Черга {safe_group})"
-                )
-                await self.broadcast(msg, filter_key="notify_outage", subscribers=subscribers, now=now)
-
-        elif current_status == STATUS_ON:
-            next_outage_msg = ""
-            if next_interval and next_interval["status"] == STATUS_OFF:
-                next_outage_msg = f" (наступне вимкнення о {next_interval['start']})"
-            elif next_interval and next_interval["status"] == STATUS_MAYBE:
-                next_outage_msg = f" (можливе вимкнення о {next_interval['start']})"
-
-            if last_status == STATUS_OFF:
-                await db.set_state("last_status", current_status)
-                msg = (
-                    f"🟢 <b>Світло увімкнено!</b>{next_outage_msg}\n"
-                    f"📍 {safe_addr} (Черга {safe_group})\n\n"
-                    "💡 Електропостачання відновлено за графіком."
-                )
-                await self.broadcast(msg, filter_key="notify_restore", subscribers=subscribers, now=now)
-            elif last_status == STATUS_MAYBE:
-                await db.set_state("last_status", current_status)
-                msg = (
-                    f"🟢 <b>Період можливого відключення завершився!</b>{next_outage_msg}\n"
-                    f"📍 {safe_addr} (Черга {safe_group})\n\n"
-                    "💡 Подальше електропостачання за графіком стабільне."
-                )
-                await self.broadcast(msg, filter_key="notify_restore", subscribers=subscribers, now=now)
-
-        elif current_status == STATUS_MAYBE:
-            if last_status != STATUS_MAYBE and not await db.get_state(alert_sent_key):
-                await db.set_state(alert_sent_key, "1")
-                await db.set_state("last_status", current_status)
-                end_time = curr_interval["end"] if curr_interval else "кінця інтервалу"
-                msg = (
-                    f"🟡 <b>Період можливого відключення (до {end_time})</b>\n"
-                    f"📍 {safe_addr} (Черга {safe_group})\n\n"
-                    "⚠️ Можливе вимкнення у разі перевищення лімітів."
-                )
-                await self.broadcast(msg, filter_key="notify_outage", subscribers=subscribers, now=now)
-
-        if last_status != current_status:
-            await db.set_state("last_status", current_status)
+            elif current_status == STATUS_ON:
+                if last_status == STATUS_OFF:
+                    await db.set_state("last_status", STATUS_ON)
+                    upcoming_off = sched_ctx["upcoming_off"]
+                    if upcoming_off:
+                        msg = f"🟢 <b>Світло є — наступне вимкнення о {upcoming_off['start']}</b>"
+                    else:
+                        msg = "🟢 <b>Світло є — сьогодні більше без вимкнень</b>"
+                    await self.broadcast(msg, filter_key="notify_restore", subscribers=subscribers, now=now)
+                elif last_status != STATUS_ON:
+                    await db.set_state("last_status", STATUS_ON)
 
         # --- Advance Warnings ---
-        if current_status != STATUS_OFF:
+        if current_status != STATUS_OFF and physical_grid != "absent":
             intervals = ScheduleParser.get_intervals(times)
-            candidate_intervals: List[Dict[str, Any]] = []
-            for inter in intervals:
-                if inter["status"] in (STATUS_OFF, STATUS_MAYBE):
-                    if current_status == STATUS_MAYBE and inter["status"] == STATUS_MAYBE:
-                        continue
-                    candidate_intervals.append({**inter, "date_str": today_str})
+            candidate_intervals: List[Dict[str, Any]] = [
+                {**inter, "date_str": today_str}
+                for inter in intervals
+                if inter["status"] == STATUS_OFF
+            ]
 
             if curr_minutes >= 24 * 60 - 30 and tomorrow_sched:
                 t_intervals = ScheduleParser.get_intervals(tomorrow_sched.get("times", {}))
                 if t_intervals and t_intervals[0]["start_minutes"] == 0:
                     t_first = t_intervals[0]
-                    if t_first["status"] in (STATUS_OFF, STATUS_MAYBE):
-                        if not (current_status == STATUS_MAYBE and t_first["status"] == STATUS_MAYBE):
-                            candidate_intervals.append(
-                                {
-                                    **t_first,
-                                    "start": "00:00",
-                                    "start_minutes": 24 * 60,
-                                    "date_str": tomorrow_str,
-                                }
-                            )
+                    if t_first["status"] == STATUS_OFF:
+                        candidate_intervals.append(
+                            {
+                                **t_first,
+                                "start": "00:00",
+                                "start_minutes": 24 * 60,
+                                "date_str": tomorrow_str,
+                            }
+                        )
 
             if candidate_intervals:
                 sent_warns = await db.get_states_by_prefix(f"warn_{today_str}_")
@@ -539,25 +580,8 @@ class NotifierService:
                             sent_warns[warn_state_key] = "1"
                             await db.set_state(warn_state_key, "1")
 
-                            if inter["status"] == STATUS_OFF:
-                                status_title = "відключення"
-                                emoji = "⚠️"
-                                action_line = (
-                                    f"О <b>{inter['start']}</b> планується вимкнення до <b>{inter['end']}</b>."
-                                )
-                            else:
-                                status_title = "можливе вимкнення"
-                                emoji = "🟡"
-                                action_line = (
-                                    f"О <b>{inter['start']}</b> починається період можливого відключення "
-                                    f"до <b>{inter['end']}</b>."
-                                )
-
                             warning_msg = (
-                                f"{emoji} <b>Через {diff} хв {status_title} світла</b>\n"
-                                f"📍 {safe_addr} (Черга {safe_group})\n\n"
-                                f"{action_line}\n"
-                                "🔌 <i>Встигніть зарядити пристрої та закінчити справи!</i>"
+                                f"⚠️ <b>Через {diff} хв вимкнення ({inter['start']}–{inter['end']})</b>"
                             )
                             await self._send_with_retry(
                                 chat_id, warning_msg, silent=silent, sub=sub
@@ -583,8 +607,8 @@ class NotifierService:
         now: Optional[datetime] = None,
     ) -> None:
         """
-        Broadcasts a factual grid transition reported by AllpowersBar ('present' or 'absent')
-        to all active subscribers and refreshes pinned live status messages.
+        Broadcasts a crisp 1-line factual grid transition reported by AllpowersBar
+        ('present' or 'absent') enriched with TOE schedule context, and refreshes pinned cards.
         """
         if new_grid not in ("present", "absent"):
             return
@@ -593,28 +617,9 @@ class NotifierService:
             tz = ZoneInfo(config.TIMEZONE)
             now = datetime.now(tz)
 
-        safe_addr = html.escape(config.short_address)
-        safe_group = html.escape(config.CHER_GPV)
-        time_str = now.strftime("%H:%M")
-
-        if new_grid == "absent":
-            msg = (
-                f"🔴 <b>Світло зникло (факт)</b>\n"
-                f"📍 {safe_addr} (Черга {safe_group})\n"
-                f"🕒 {time_str}"
-            )
-            filter_key = "notify_outage"
-        else:
-            msg = (
-                f"🟢 <b>Світло з'явилося (факт)</b>\n"
-                f"📍 {safe_addr} (Черга {safe_group})\n"
-                f"🕒 {time_str}"
-            )
-            filter_key = "notify_restore"
-
-        subscribers = await db.get_active_subscribers()
-        await self.broadcast(msg, filter_key=filter_key, subscribers=subscribers, now=now)
-
+        schedule_members = None
+        today_sched = None
+        tomorrow_sched = None
         try:
             schedule_members = await self.api.get_schedule()
             if schedule_members is not None:
@@ -632,13 +637,46 @@ class NotifierService:
                     if tomorrow_graph
                     else None
                 )
+        except Exception as e:
+            logger.warning(f"Could not read schedule context for station transition: {e}")
+
+        sched_ctx = self._resolve_schedule_context(today_sched, tomorrow_sched, now)
+
+        if new_grid == "absent":
+            if sched_ctx["curr_off_end"]:
+                msg = f"🔴 <b>Світло зникло — до {sched_ctx['curr_off_end']} (за графіком)</b>"
+            elif sched_ctx["near_upcoming_off"]:
+                msg = (
+                    f"🔴 <b>Світло зникло — раніше графіка "
+                    f"(до {sched_ctx['near_upcoming_off']['end']})</b>"
+                )
+            else:
+                msg = "🔴 <b>Світло зникло — поза графіком</b>"
+            filter_key = "notify_outage"
+            await db.set_state("last_status", STATUS_OFF)
+        else:
+            upcoming_off = sched_ctx["upcoming_off"]
+            if upcoming_off:
+                msg = f"🟢 <b>Світло є — наступне вимкнення о {upcoming_off['start']}</b>"
+            elif today_sched:
+                msg = "🟢 <b>Світло є — сьогодні більше без вимкнень</b>"
+            else:
+                msg = "🟢 <b>Світло є</b>"
+            filter_key = "notify_restore"
+            await db.set_state("last_status", STATUS_ON)
+
+        subscribers = await db.get_active_subscribers()
+        await self.broadcast(msg, filter_key=filter_key, subscribers=subscribers, now=now)
+
+        if schedule_members is not None:
+            try:
                 live_status = ScheduleParser.format_status_message(
                     today_sched, tomorrow_sched, now, physical_grid=new_grid
                 )
                 pinned_text = f"📌 <b>ЖИВИЙ СТАТУС (ОНОВЛЮЄТЬСЯ АВТОМАТИЧНО)</b>\n\n{live_status}"
                 await self.update_pinned_messages(pinned_text, subscribers=subscribers)
-        except Exception as e:
-            logger.warning(f"Could not refresh pinned status after station transition: {e}")
+            except Exception as e:
+                logger.warning(f"Could not refresh pinned status after station transition: {e}")
 
     async def start(self):
         """

@@ -31,6 +31,7 @@ PROTECTED_STATE_KEYS = (
     "last_status",
     "active_accidents_hash",
     "active_planed_accidents_hash",
+    "pending_restart_notify_chat_id",
 )
 
 

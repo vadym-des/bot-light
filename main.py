@@ -37,6 +37,24 @@ async def set_commands(bot: Bot):
     await bot.set_my_commands(commands)
 
 
+async def notify_owner_restart_complete(bot: Bot) -> None:
+    try:
+        raw_chat_id = (await db.get_state("pending_restart_notify_chat_id") or "").strip()
+        if not raw_chat_id:
+            return
+        await db.set_state("pending_restart_notify_chat_id", "")
+        chat_id = int(raw_chat_id)
+        if config.DEFAULT_CHAT_ID and chat_id != config.DEFAULT_CHAT_ID:
+            return
+        await bot.send_message(
+            chat_id=chat_id,
+            text="✅ <b>Бот успішно перезапустився і готовий до роботи!</b>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning(f"Could not send restart confirmation to owner: {e}")
+
+
 async def keep_alive(service_url: str):
     health_url = f"{service_url.rstrip('/')}/health"
     logger.info(f"Keep-alive self-ping configured for: {health_url}")
@@ -119,6 +137,8 @@ async def main():
             logger.info("Bot commands registered.")
         except Exception as e:
             logger.warning(f"Could not register bot commands at startup: {e}")
+
+        await notify_owner_restart_complete(bot)
 
         notifier_task = asyncio.create_task(notifier_service.start())
         bg_tasks.append(notifier_task)
