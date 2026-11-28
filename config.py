@@ -63,6 +63,13 @@ class Config:
     RENDER_EXTERNAL_URL: str = field(default_factory=lambda: _get_str_env("RENDER_EXTERNAL_URL", "").rstrip("/"))
     RENDER_DEPLOY_HOOK_URL: str = field(default_factory=lambda: _get_str_env("RENDER_DEPLOY_HOOK_URL", ""))
     BOT_USERNAME: str = field(default_factory=lambda: _get_str_env("BOT_USERNAME", "").lstrip("@"))
+    STATION_API_TOKEN: str = field(default_factory=lambda: _get_str_env("STATION_API_TOKEN", ""))
+    STATION_STATE_TTL_SECONDS: int = field(
+        default_factory=lambda: max(30, _get_int_env("STATION_STATE_TTL_SECONDS", 180))
+    )
+    STATION_DEBOUNCE_SECONDS: int = field(
+        default_factory=lambda: max(0, _get_int_env("STATION_DEBOUNCE_SECONDS", 20))
+    )
 
     @property
     def clean_street(self) -> str:

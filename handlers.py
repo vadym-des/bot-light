@@ -77,6 +77,7 @@ def _api_unavailable_message() -> str:
 async def build_status_message(
     api_client: ToeApiClient,
     max_cache_age: Optional[float] = None,
+    station_monitor=None,
 ) -> str:
     """
     Constructs the real-time status message based on current power schedule and time.
@@ -100,7 +101,10 @@ async def build_status_message(
         ScheduleParser.extract_day_schedule(tomorrow_graph, config.CHER_GPV) if tomorrow_graph else None
     )
 
-    return ScheduleParser.format_status_message(today_sched, tomorrow_sched, now)
+    physical_grid = station_monitor.get_live_grid() if station_monitor else None
+    return ScheduleParser.format_status_message(
+        today_sched, tomorrow_sched, now, physical_grid=physical_grid
+    )
 
 
 async def build_today_message(
@@ -252,6 +256,7 @@ async def _send_fresh_status(
     send_fn,
     api_client: ToeApiClient,
     sub: Optional[dict] = None,
+    station_monitor=None,
 ) -> None:
     """Deletes the previous status card (if any), sends a fresh one, and persists its message_id."""
     if sub is None:
@@ -263,7 +268,7 @@ async def _send_fresh_status(
         except Exception:
             pass
 
-    status_text = await build_status_message(api_client)
+    status_text = await build_status_message(api_client, station_monitor=station_monitor)
     sent_msg = await send_fn(
         status_text,
         reply_markup=get_status_inline_keyboard(is_pinned=False),
@@ -273,7 +278,7 @@ async def _send_fresh_status(
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, api_client: ToeApiClient):
+async def cmd_start(message: Message, api_client: ToeApiClient, station_monitor=None):
     chat_id = message.chat.id
     user = message.from_user
     if message.chat.type == "private":
@@ -300,7 +305,14 @@ async def cmd_start(message: Message, api_client: ToeApiClient):
     )
 
     await message.answer(greeting, reply_markup=get_main_reply_keyboard(), parse_mode="HTML")
-    await _send_fresh_status(chat_id, message.bot, message.answer, api_client, sub=sub)
+    await _send_fresh_status(
+        chat_id,
+        message.bot,
+        message.answer,
+        api_client,
+        sub=sub,
+        station_monitor=station_monitor,
+    )
 
 
 @router.message(Command("stop", "unsubscribe"))
@@ -326,25 +338,41 @@ async def cmd_stop(message: Message):
 
 
 @router.message(or_f(Command("status", "now"), F.text == "💡 Поточний стан"))
-async def handle_status(message: Message, api_client: ToeApiClient):
-    await _send_fresh_status(message.chat.id, message.bot, message.answer, api_client)
+async def handle_status(message: Message, api_client: ToeApiClient, station_monitor=None):
+    await _send_fresh_status(
+        message.chat.id,
+        message.bot,
+        message.answer,
+        api_client,
+        station_monitor=station_monitor,
+    )
 
 
 @router.callback_query(F.data == "btn_status")
-async def cb_btn_status(call: CallbackQuery, api_client: ToeApiClient):
-    await _send_fresh_status(call.message.chat.id, call.bot, call.message.answer, api_client)
+async def cb_btn_status(call: CallbackQuery, api_client: ToeApiClient, station_monitor=None):
+    await _send_fresh_status(
+        call.message.chat.id,
+        call.bot,
+        call.message.answer,
+        api_client,
+        station_monitor=station_monitor,
+    )
     await call.answer()
 
 
 @router.callback_query(F.data == "refresh_status")
-async def cb_refresh_status(call: CallbackQuery, api_client: ToeApiClient):
-    status_text = await build_status_message(api_client, max_cache_age=10.0)
+async def cb_refresh_status(call: CallbackQuery, api_client: ToeApiClient, station_monitor=None):
+    status_text = await build_status_message(
+        api_client, max_cache_age=10.0, station_monitor=station_monitor
+    )
     await _safe_edit_message(call, status_text, get_status_inline_keyboard(is_pinned=False))
 
 
 @router.callback_query(F.data == "refresh_pinned_status")
-async def cb_refresh_pinned_status(call: CallbackQuery, api_client: ToeApiClient):
-    status_text = await build_status_message(api_client, max_cache_age=10.0)
+async def cb_refresh_pinned_status(call: CallbackQuery, api_client: ToeApiClient, station_monitor=None):
+    status_text = await build_status_message(
+        api_client, max_cache_age=10.0, station_monitor=station_monitor
+    )
     await _safe_edit_message(
         call,
         f"{PINNED_HEADER}{status_text}",
@@ -353,12 +381,12 @@ async def cb_refresh_pinned_status(call: CallbackQuery, api_client: ToeApiClient
 
 
 @router.callback_query(F.data == "pin_live_status")
-async def cb_pin_live_status(call: CallbackQuery, api_client: ToeApiClient):
+async def cb_pin_live_status(call: CallbackQuery, api_client: ToeApiClient, station_monitor=None):
     chat_id = call.message.chat.id
     sub = await db.get_subscriber(chat_id)
     old_pinned_id = sub.get("pinned_message_id") if sub else None
 
-    status_text = await build_status_message(api_client)
+    status_text = await build_status_message(api_client, station_monitor=station_monitor)
     sent_msg = await call.message.answer(
         f"{PINNED_HEADER}{status_text}",
         reply_markup=get_status_inline_keyboard(is_pinned=True),

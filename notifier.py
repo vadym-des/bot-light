@@ -37,10 +37,12 @@ class NotifierService:
         bot: Bot,
         api_client: ToeApiClient,
         bot_username: Optional[str] = None,
+        station_monitor=None,
     ):
         self.bot = bot
         self.api = api_client
         self.bot_username = bot_username
+        self.station_monitor = station_monitor
         self.is_running = False
 
     async def _send_with_retry(
@@ -389,7 +391,10 @@ class NotifierService:
         )
 
         # Update live pinned messages
-        live_status = ScheduleParser.format_status_message(today_sched, tomorrow_sched, now)
+        physical_grid = self.station_monitor.get_live_grid() if self.station_monitor else None
+        live_status = ScheduleParser.format_status_message(
+            today_sched, tomorrow_sched, now, physical_grid=physical_grid
+        )
         pinned_text = f"📌 <b>ЖИВИЙ СТАТУС (ОНОВЛЮЄТЬСЯ АВТОМАТИЧНО)</b>\n\n{live_status}"
         await self.update_pinned_messages(pinned_text, subscribers=subscribers)
 
@@ -571,6 +576,69 @@ class NotifierService:
                     subscribers=subscribers,
                     now=now,
                 )
+
+    async def handle_station_transition(
+        self,
+        new_grid: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """
+        Broadcasts a factual grid transition reported by AllpowersBar ('present' or 'absent')
+        to all active subscribers and refreshes pinned live status messages.
+        """
+        if new_grid not in ("present", "absent"):
+            return
+
+        if now is None:
+            tz = ZoneInfo(config.TIMEZONE)
+            now = datetime.now(tz)
+
+        safe_addr = html.escape(config.short_address)
+        safe_group = html.escape(config.CHER_GPV)
+        time_str = now.strftime("%H:%M")
+
+        if new_grid == "absent":
+            msg = (
+                f"🔴 <b>Світло зникло (факт)</b>\n"
+                f"📍 {safe_addr} (Черга {safe_group})\n"
+                f"🕒 {time_str}"
+            )
+            filter_key = "notify_outage"
+        else:
+            msg = (
+                f"🟢 <b>Світло з'явилося (факт)</b>\n"
+                f"📍 {safe_addr} (Черга {safe_group})\n"
+                f"🕒 {time_str}"
+            )
+            filter_key = "notify_restore"
+
+        subscribers = await db.get_active_subscribers()
+        await self.broadcast(msg, filter_key=filter_key, subscribers=subscribers, now=now)
+
+        try:
+            schedule_members = await self.api.get_schedule()
+            if schedule_members is not None:
+                today_str = now.strftime("%Y-%m-%d")
+                tomorrow_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+                today_graph = ScheduleParser.select_day_graph(schedule_members, today_str)
+                tomorrow_graph = ScheduleParser.select_day_graph(schedule_members, tomorrow_str)
+                today_sched = (
+                    ScheduleParser.extract_day_schedule(today_graph, config.CHER_GPV)
+                    if today_graph
+                    else None
+                )
+                tomorrow_sched = (
+                    ScheduleParser.extract_day_schedule(tomorrow_graph, config.CHER_GPV)
+                    if tomorrow_graph
+                    else None
+                )
+                live_status = ScheduleParser.format_status_message(
+                    today_sched, tomorrow_sched, now, physical_grid=new_grid
+                )
+                pinned_text = f"📌 <b>ЖИВИЙ СТАТУС (ОНОВЛЮЄТЬСЯ АВТОМАТИЧНО)</b>\n\n{live_status}"
+                await self.update_pinned_messages(pinned_text, subscribers=subscribers)
+        except Exception as e:
+            logger.warning(f"Could not refresh pinned status after station transition: {e}")
 
     async def start(self):
         """

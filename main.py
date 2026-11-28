@@ -12,6 +12,7 @@ from config import config
 from database import db
 from api_client import ToeApiClient
 from notifier import NotifierService
+from station_monitor import StationMonitor
 from handlers import router
 from keyboards import set_bot_username
 
@@ -72,16 +73,29 @@ async def main():
         token=config.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    station_monitor = StationMonitor(
+        ttl_seconds=config.STATION_STATE_TTL_SECONDS,
+        debounce_seconds=config.STATION_DEBOUNCE_SECONDS,
+    )
     dp = Dispatcher()
     dp["api_client"] = api_client
+    dp["station_monitor"] = station_monitor
     dp.include_router(router)
 
-    notifier_service = NotifierService(bot=bot, api_client=api_client)
+    notifier_service = NotifierService(
+        bot=bot,
+        api_client=api_client,
+        station_monitor=station_monitor,
+    )
 
     # Start lightweight health check HTTP server BEFORE Telegram network calls
     health_app = web.Application()
     health_app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
     health_app.router.add_get("/health", lambda r: web.Response(text="OK"))
+    health_app.router.add_post(
+        "/api/station-state",
+        station_monitor.create_http_handler(notifier_service),
+    )
 
     runner = web.AppRunner(health_app)
     await runner.setup()
@@ -120,6 +134,7 @@ async def main():
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         logger.info("Stopping bot and services...")
+        station_monitor.stop()
         notifier_service.stop()
         for task in bg_tasks:
             task.cancel()

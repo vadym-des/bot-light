@@ -384,6 +384,7 @@ class ScheduleParser:
         today_sched: Optional[Dict[str, Any]],
         tomorrow_sched: Optional[Dict[str, Any]] = None,
         dt: Optional[datetime] = None,
+        physical_grid: Optional[str] = None,
     ) -> str:
         """
         Builds a human, logical real-time status message without robotic clutter.
@@ -398,7 +399,13 @@ class ScheduleParser:
 
         if not today_sched:
             formatted_today = dt.strftime("%d.%m.%Y")
+            prefix = ""
+            if physical_grid == "present":
+                prefix = "🟢 <b>СВІТЛО Є (факт зі станції)</b>\n"
+            elif physical_grid == "absent":
+                prefix = "🔴 <b>СВІТЛА НЕМАЄ (факт зі станції)</b>\n"
             return (
+                f"{prefix}"
                 f"ℹ️ <b>Офіційний графік на сьогодні ({formatted_today}) відсутній на сайті обленерго.</b>\n"
                 f"{addr_line}\n"
                 f"🕒 <b>Зараз:</b> {curr_time_str}\n\n"
@@ -578,6 +585,27 @@ class ScheduleParser:
             lines.append(addr_line)
             lines.append(f"🕒 <b>Зараз:</b> {curr_time_str}\n")
             lines.append("ℹ️ Отримано нестандартний код статусу від API обленерго.")
+
+        if physical_grid == "present" and lines:
+            if curr_status == STATUS_ON:
+                lines[0] = "🟢 <b>СВІТЛО Є (підтверджено станцією)</b>\n"
+            else:
+                lines[0] = "🟢 <b>СВІТЛО Є (факт зі станції)</b>\n"
+                if len(lines) > 2:
+                    lines.insert(
+                        3,
+                        "⚡️ <i>За даними станції зараз у мережі є 220V (попри графік).</i>\n",
+                    )
+        elif physical_grid == "absent" and lines:
+            if curr_status == STATUS_OFF:
+                lines[0] = "🔴 <b>СВІТЛА НЕМАЄ (підтверджено станцією)</b>\n"
+            else:
+                lines[0] = "🔴 <b>СВІТЛА НЕМАЄ (факт зі станції)</b>\n"
+                if len(lines) > 2:
+                    lines.insert(
+                        3,
+                        "🔌 <i>За даними станції зараз у мережі немає 220V (попри графік).</i>\n",
+                    )
 
         return "\n".join(lines)
 
